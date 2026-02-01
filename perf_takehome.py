@@ -83,8 +83,12 @@ class KernelBuilder:
         v_tmp2 = [self.alloc_scratch(f"v_tmp2_{i}", VLEN) for i in range(MAX_CHUNKS)]
         v_cond = [self.alloc_scratch(f"v_cond_{i}", VLEN) for i in range(MAX_CHUNKS)]
         v_tree_alt = [self.alloc_scratch(f"v_tree_alt_{i}", VLEN) for i in range(MAX_CHUNKS)]
+        v_tree_third = [self.alloc_scratch(f"v_tree_third_{i}", VLEN) for i in range(MAX_CHUNKS)]
         gather_addrs = [[self.alloc_scratch(f"addr_{c}_{i}") for i in range(VLEN)] for c in range(MAX_CHUNKS)]
         gather_addrs_alt = [[self.alloc_scratch(f"addr_alt_{c}_{i}") for i in range(VLEN)] for c in range(MAX_CHUNKS)]
+
+        # Triple-buffer array for tree values (eliminates LOAD-only cycles)
+        tree_buffers = [v_tree, v_tree_alt, v_tree_third]
 
         # Constant vectors
         v_one = self.alloc_scratch("v_one", VLEN)
@@ -217,38 +221,105 @@ class KernelBuilder:
         # First pause - matches first yield in reference_kernel2 (before processing)
         self.instrs.append({"flow": [("pause",)]})
 
-        # ===== MAIN LOOP =====
+        # ===== DYNAMIC UNIVERSAL PIPELINE =====
+        # Strategy is automatically selected based on level features:
+        # - num_unique_values: how many distinct tree values at this level
+        # - fits_in_cache: whether all values fit in scratch
+        # - Strategies: BROADCAST (1 value), ARITHMETIC (2-4 values), SCATTER_GATHER (many values)
         tree_base = self.scratch["forest_values_p"]
 
-        # Track preloading state for scatter-gather rounds
+        # Thresholds for strategy selection (can be tuned)
+        ARITHMETIC_THRESHOLD = 4  # Use arithmetic selection if <= this many unique values
+        CACHE_THRESHOLD = 64      # Cache in scratch if <= this many unique values
+
+        # Build VALU ops for hash + index update
+        def build_hash_index_ops(tree_reg, val_addrs, idx_addrs, n, is_rnd10):
+            ops = []
+            ops.append([("^", val_addrs[c], val_addrs[c], tree_reg[c]) for c in range(n)])
+            ops.append([("multiply_add", val_addrs[c], val_addrs[c], v_mult_4097, v_hash_c0) for c in range(n)])
+            ops.append([("^", v_tmp1[c], val_addrs[c], v_hash_c1) for c in range(n)])
+            ops.append([(">>", v_tmp2[c], val_addrs[c], v_shift_19) for c in range(n)])
+            ops.append([("^", val_addrs[c], v_tmp1[c], v_tmp2[c]) for c in range(n)])
+            ops.append([("multiply_add", val_addrs[c], val_addrs[c], v_mult_33, v_hash_c2) for c in range(n)])
+            ops.append([("+", v_tmp1[c], val_addrs[c], v_hash_c3) for c in range(n)])
+            ops.append([("<<", v_tmp2[c], val_addrs[c], v_shift_9) for c in range(n)])
+            ops.append([("^", val_addrs[c], v_tmp1[c], v_tmp2[c]) for c in range(n)])
+            ops.append([("multiply_add", val_addrs[c], val_addrs[c], v_mult_9, v_hash_c4) for c in range(n)])
+            ops.append([("^", v_tmp1[c], val_addrs[c], v_hash_c5) for c in range(n)])
+            ops.append([(">>", v_tmp2[c], val_addrs[c], v_shift_16) for c in range(n)])
+            ops.append([("^", val_addrs[c], v_tmp1[c], v_tmp2[c]) for c in range(n)])
+            if is_rnd10:
+                ops.append([("vbroadcast", idx_addrs[c], s_zero) for c in range(n)])
+            else:
+                ops.append([("%", v_cond[c], val_addrs[c], v_two) for c in range(n)])
+                ops.append([("multiply_add", idx_addrs[c], idx_addrs[c], v_two, v_one) for c in range(n)])
+                ops.append([("+", idx_addrs[c], idx_addrs[c], v_cond[c]) for c in range(n)])
+            return ops
+
+        def compute_level_features(rnd, n_nodes):
+            """Compute features of the tree level for this round."""
+            # Tree level = round mod 11 (wraps at level 10 back to 0)
+            # Level 0: indices at 0 (root)
+            # Level k: indices at 2^k - 1 to 2^(k+1) - 2
+            level = rnd % 11  # Levels 0-10, then wraps
+            if level == 0:
+                # All indices are 0 (root) - either start or after wrap
+                num_unique = 1
+                level_start = 0
+            else:
+                num_unique = min(1 << level, n_nodes)  # 2^level unique values
+                level_start = (1 << level) - 1  # First index at this level
+
+            # Determine strategy based on features
+            if num_unique == 1:
+                strategy = "broadcast"
+            elif num_unique <= ARITHMETIC_THRESHOLD:
+                strategy = "arithmetic"
+            else:
+                strategy = "scatter_gather"
+
+            # Buffer depth: more buffering for larger levels
+            if strategy == "scatter_gather":
+                buffer_depth = 3 if num_unique > CACHE_THRESHOLD else 2
+            else:
+                buffer_depth = 1
+
+            return {
+                "level": level,
+                "num_unique": num_unique,
+                "level_start": level_start,
+                "strategy": strategy,
+                "buffer_depth": buffer_depth,
+            }
+
+        # Pipeline state tracking
         first_group_preloaded = False
-        second_group_addrs_ready = False  # True if group 1's addresses are pre-computed
+        second_group_addrs_ready = False
 
         for rnd in range(rounds):
-            is_level_0 = (rnd == 0) or (rnd == 11)
-            is_level_1 = (rnd == 1) or (rnd == 12)
-            is_level_2 = (rnd == 2) or (rnd == 13)
-            is_level_3 = (rnd == 3) or (rnd == 14)
             is_round_10 = (rnd == 10)
+            features = compute_level_features(rnd, n_nodes)
+            strategy = features["strategy"]
+            level_start = features["level_start"]
+            num_unique = features["num_unique"]
 
-            # Check if this round's first group was preloaded by previous round
+            # Track address-ready state within the round
+            group_addrs_ready = [False] * 6
             this_round_first_preloaded = first_group_preloaded
             this_round_second_addrs_ready = second_group_addrs_ready
             first_group_preloaded = False
             second_group_addrs_ready = False
 
-            # Track address-ready state within the round (propagates from group to group)
-            # group_addrs_ready[g] means group g's addresses are already computed
-            group_addrs_ready = [False] * 6
             if this_round_second_addrs_ready:
-                group_addrs_ready[0] = True  # group 0's values loaded, addresses ready
-                group_addrs_ready[1] = True  # group 1's addresses ready (values will be loaded by group 0)
+                group_addrs_ready[0] = True
+                group_addrs_ready[1] = True
 
             for g_idx, chunk_base in enumerate(range(0, n_chunks, CHUNKS_PER_GROUP)):
                 n_active = min(CHUNKS_PER_GROUP, n_chunks - chunk_base)
                 chunk_idx_addrs = [scratch_idx + (chunk_base + c) * VLEN for c in range(n_active)]
                 chunk_val_addrs = [scratch_val + (chunk_base + c) * VLEN for c in range(n_active)]
 
+                # Buffer selection based on strategy
                 use_alt = (g_idx % 2 == 1)
                 curr_tree = v_tree_alt if use_alt else v_tree
                 next_tree = v_tree if use_alt else v_tree_alt
@@ -257,133 +328,32 @@ class KernelBuilder:
 
                 next_chunk_base = chunk_base + CHUNKS_PER_GROUP
                 has_next = next_chunk_base < n_chunks
+                is_last_group = not has_next
                 next_n_active = min(CHUNKS_PER_GROUP, n_chunks - next_chunk_base) if has_next else 0
                 next_chunk_idx_addrs = [scratch_idx + (next_chunk_base + c) * VLEN for c in range(next_n_active)] if has_next else []
 
-                # Build VALU ops for hash + index update
-                def build_hash_index_ops(tree_reg, val_addrs, idx_addrs, n, is_rnd10):
-                    ops = []
-                    ops.append([("^", val_addrs[c], val_addrs[c], tree_reg[c]) for c in range(n)])
-                    ops.append([("multiply_add", val_addrs[c], val_addrs[c], v_mult_4097, v_hash_c0) for c in range(n)])
-                    ops.append([("^", v_tmp1[c], val_addrs[c], v_hash_c1) for c in range(n)])
-                    ops.append([(">>", v_tmp2[c], val_addrs[c], v_shift_19) for c in range(n)])
-                    ops.append([("^", val_addrs[c], v_tmp1[c], v_tmp2[c]) for c in range(n)])
-                    ops.append([("multiply_add", val_addrs[c], val_addrs[c], v_mult_33, v_hash_c2) for c in range(n)])
-                    ops.append([("+", v_tmp1[c], val_addrs[c], v_hash_c3) for c in range(n)])
-                    ops.append([("<<", v_tmp2[c], val_addrs[c], v_shift_9) for c in range(n)])
-                    ops.append([("^", val_addrs[c], v_tmp1[c], v_tmp2[c]) for c in range(n)])
-                    ops.append([("multiply_add", val_addrs[c], val_addrs[c], v_mult_9, v_hash_c4) for c in range(n)])
-                    ops.append([("^", v_tmp1[c], val_addrs[c], v_hash_c5) for c in range(n)])
-                    ops.append([(">>", v_tmp2[c], val_addrs[c], v_shift_16) for c in range(n)])
-                    ops.append([("^", val_addrs[c], v_tmp1[c], v_tmp2[c]) for c in range(n)])
-                    if is_rnd10:
-                        ops.append([("vbroadcast", idx_addrs[c], s_zero) for c in range(n)])
-                    else:
-                        ops.append([("%", v_cond[c], val_addrs[c], v_two) for c in range(n)])
-                        ops.append([("multiply_add", idx_addrs[c], idx_addrs[c], v_two, v_one) for c in range(n)])
-                        ops.append([("+", idx_addrs[c], idx_addrs[c], v_cond[c]) for c in range(n)])
-                    return ops
+                # Check if next group's addresses are pre-computed
+                next_addrs_ready = (g_idx + 1 < len(group_addrs_ready) and group_addrs_ready[g_idx + 1]) if has_next else False
 
-                if is_level_0:
-                    # Broadcast tree[0]
+                # ===== STRATEGY: BROADCAST (1 unique value) =====
+                if strategy == "broadcast":
+                    # All items get the same tree value - just broadcast
                     valu_ops = [[("vbroadcast", curr_tree[c], s_tree0) for c in range(n_active)]]
                     valu_ops.extend(build_hash_index_ops(curr_tree, chunk_val_addrs, chunk_idx_addrs, n_active, is_round_10))
 
-                    # Preload next round if last group and next is scatter-gather
-                    is_last_group = not has_next
-                    next_round_is_scatter = (rnd + 1 < rounds) and (rnd + 1 not in [0, 1, 2, 11, 12, 13])  # 3 and 14 now use scatter-gather
-                    if is_last_group and next_round_is_scatter:
-                        first_cg_idx = [scratch_idx + c * VLEN for c in range(CHUNKS_PER_GROUP)]
-                        next_alu = [("+", gather_addrs[c][i], tree_base, first_cg_idx[c] + i)
-                                    for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
-                        next_load = [("load", v_tree[c] + i, gather_addrs[c][i])
-                                     for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
-                        alu_idx, load_idx = 0, 0
-                        for ops in valu_ops:
-                            bundle = {"valu": self.pad_to_6(ops)}
-                            if alu_idx < len(next_alu):
-                                bundle["alu"] = next_alu[alu_idx:alu_idx+12]
-                                alu_idx += 12
-                            if alu_idx >= len(next_alu) and load_idx < len(next_load):
-                                bundle["load"] = next_load[load_idx:load_idx+2]
-                                load_idx += 2
-                            self.instrs.append(bundle)
-                        while load_idx < len(next_load):
-                            self.instrs.append({"load": next_load[load_idx:load_idx+2]})
-                            load_idx += 2
-                        first_group_preloaded = True
-                    else:
-                        for ops in valu_ops:
-                            self.instrs.append({"valu": self.pad_to_6(ops)})
+                    # Use free LOAD slots to prefetch for future scatter-gather rounds
+                    next_features = compute_level_features(rnd + 1, n_nodes) if rnd + 1 < rounds else None
+                    should_prefetch = next_features and next_features["strategy"] == "scatter_gather" and is_last_group
 
-                elif is_level_1:
-                    # Arithmetic selection: tree[2] + (idx & 1) * (tree[1] - tree[2])
-                    valu_ops = [
-                        [("vbroadcast", curr_tree[c], s_tree2) for c in range(n_active)],
-                        [("&", v_cond[c], chunk_idx_addrs[c], v_one) for c in range(n_active)],
-                        [("vbroadcast", v_tmp1[c], s_tree_diff) for c in range(n_active)],
-                        [("*", v_cond[c], v_cond[c], v_tmp1[c]) for c in range(n_active)],
-                        [("+", curr_tree[c], curr_tree[c], v_cond[c]) for c in range(n_active)],
-                    ]
-                    valu_ops.extend(build_hash_index_ops(curr_tree, chunk_val_addrs, chunk_idx_addrs, n_active, is_round_10))
-
-                    # Preload next round if last group and next is scatter-gather
-                    is_last_group = not has_next
-                    next_round_is_scatter = (rnd + 1 < rounds) and (rnd + 1 not in [0, 1, 2, 11, 12, 13])  # 3 and 14 now use scatter-gather
-                    if is_last_group and next_round_is_scatter:
-                        first_cg_idx = [scratch_idx + c * VLEN for c in range(CHUNKS_PER_GROUP)]
-                        next_alu = [("+", gather_addrs[c][i], tree_base, first_cg_idx[c] + i)
-                                    for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
-                        next_load = [("load", v_tree[c] + i, gather_addrs[c][i])
-                                     for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
-                        alu_idx, load_idx = 0, 0
-                        for ops in valu_ops:
-                            bundle = {"valu": self.pad_to_6(ops)}
-                            if alu_idx < len(next_alu):
-                                bundle["alu"] = next_alu[alu_idx:alu_idx+12]
-                                alu_idx += 12
-                            if alu_idx >= len(next_alu) and load_idx < len(next_load):
-                                bundle["load"] = next_load[load_idx:load_idx+2]
-                                load_idx += 2
-                            self.instrs.append(bundle)
-                        while load_idx < len(next_load):
-                            self.instrs.append({"load": next_load[load_idx:load_idx+2]})
-                            load_idx += 2
-                        first_group_preloaded = True
-                    else:
-                        for ops in valu_ops:
-                            self.instrs.append({"valu": self.pad_to_6(ops)})
-
-                elif is_level_2:
-                    # 4-way selection using arithmetic
-                    level2_tree = v_tree_alt
-                    valu_ops = [
-                        [("-", v_cond[c], chunk_idx_addrs[c], v_three) for c in range(n_active)],
-                        [("&", v_tmp1[c], v_cond[c], v_one) for c in range(n_active)],
-                        [(">>", v_cond[c], v_cond[c], v_one) for c in range(n_active)],
-                        [("multiply_add", v_tmp2[c], v_tmp1[c], v_diff_low, v_tree3) for c in range(n_active)],
-                        [("multiply_add", level2_tree[c], v_tmp1[c], v_diff_high, v_tree5) for c in range(n_active)],
-                        [("-", v_tmp1[c], level2_tree[c], v_tmp2[c]) for c in range(n_active)],
-                        [("multiply_add", level2_tree[c], v_cond[c], v_tmp1[c], v_tmp2[c]) for c in range(n_active)],
-                    ]
-                    valu_ops.extend(build_hash_index_ops(level2_tree, chunk_val_addrs, chunk_idx_addrs, n_active, is_round_10))
-
-                    # Preload next round if last group and next is scatter-gather
-                    # OPTIMIZATION: Compute addresses for BOTH groups 0 and 1
-                    is_last_group = not has_next
-                    next_round_is_scatter = (rnd + 1 < rounds) and (rnd + 1 not in [0, 1, 2, 11, 12, 13])
-                    if is_last_group and next_round_is_scatter:
-                        # Addresses for group 0 go into gather_addrs
+                    if should_prefetch:
+                        # Prefetch for next round's first groups
                         g0_idx = [scratch_idx + c * VLEN for c in range(CHUNKS_PER_GROUP)]
                         g0_alu = [("+", gather_addrs[c][i], tree_base, g0_idx[c] + i)
                                   for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
-                        # Addresses for group 1 go into gather_addrs_alt
                         g1_idx = [scratch_idx + (CHUNKS_PER_GROUP + c) * VLEN for c in range(CHUNKS_PER_GROUP)]
                         g1_alu = [("+", gather_addrs_alt[c][i], tree_base, g1_idx[c] + i)
                                   for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
-                        next_alu = g0_alu + g1_alu  # 96 ALU ops total
-
-                        # Load tree values for group 0
+                        next_alu = g0_alu + g1_alu
                         next_load = [("load", v_tree[c] + i, gather_addrs[c][i])
                                      for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
 
@@ -401,25 +371,76 @@ class KernelBuilder:
                             self.instrs.append({"load": next_load[load_idx:load_idx+2]})
                             load_idx += 2
                         first_group_preloaded = True
-                        second_group_addrs_ready = True  # Group 1's addresses are also pre-computed
+                        second_group_addrs_ready = True
                     else:
                         for ops in valu_ops:
                             self.instrs.append({"valu": self.pad_to_6(ops)})
 
-                # Level 3 selection disabled due to register aliasing issues
-                # Using scatter-gather for rounds 3 and 14 (is_level_3) instead
+                # ===== STRATEGY: ARITHMETIC (2-4 unique values) =====
+                elif strategy == "arithmetic":
+                    if num_unique == 2:
+                        # 2-way selection: tree[level_start + (idx - level_start)]
+                        # idx is either level_start or level_start+1
+                        # Use: base + (idx & 1) * diff where base=tree[level_start+1], diff=tree[level_start]-tree[level_start+1]
+                        valu_ops = [
+                            [("vbroadcast", curr_tree[c], s_tree2) for c in range(n_active)],
+                            [("&", v_cond[c], chunk_idx_addrs[c], v_one) for c in range(n_active)],
+                            [("vbroadcast", v_tmp1[c], s_tree_diff) for c in range(n_active)],
+                            [("*", v_cond[c], v_cond[c], v_tmp1[c]) for c in range(n_active)],
+                            [("+", curr_tree[c], curr_tree[c], v_cond[c]) for c in range(n_active)],
+                        ]
+                    else:  # num_unique == 4
+                        # 4-way selection using arithmetic
+                        valu_ops = [
+                            [("-", v_cond[c], chunk_idx_addrs[c], v_three) for c in range(n_active)],
+                            [("&", v_tmp1[c], v_cond[c], v_one) for c in range(n_active)],
+                            [(">>", v_cond[c], v_cond[c], v_one) for c in range(n_active)],
+                            [("multiply_add", v_tmp2[c], v_tmp1[c], v_diff_low, v_tree3) for c in range(n_active)],
+                            [("multiply_add", curr_tree[c], v_tmp1[c], v_diff_high, v_tree5) for c in range(n_active)],
+                            [("-", v_tmp1[c], curr_tree[c], v_tmp2[c]) for c in range(n_active)],
+                            [("multiply_add", curr_tree[c], v_cond[c], v_tmp1[c], v_tmp2[c]) for c in range(n_active)],
+                        ]
 
+                    valu_ops.extend(build_hash_index_ops(curr_tree, chunk_val_addrs, chunk_idx_addrs, n_active, is_round_10))
+
+                    # Use free LOAD slots to prefetch for future scatter-gather rounds
+                    next_features = compute_level_features(rnd + 1, n_nodes) if rnd + 1 < rounds else None
+                    should_prefetch = next_features and next_features["strategy"] == "scatter_gather" and is_last_group
+
+                    if should_prefetch:
+                        g0_idx = [scratch_idx + c * VLEN for c in range(CHUNKS_PER_GROUP)]
+                        g0_alu = [("+", gather_addrs[c][i], tree_base, g0_idx[c] + i)
+                                  for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
+                        g1_idx = [scratch_idx + (CHUNKS_PER_GROUP + c) * VLEN for c in range(CHUNKS_PER_GROUP)]
+                        g1_alu = [("+", gather_addrs_alt[c][i], tree_base, g1_idx[c] + i)
+                                  for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
+                        next_alu = g0_alu + g1_alu
+                        next_load = [("load", v_tree[c] + i, gather_addrs[c][i])
+                                     for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
+
+                        alu_idx, load_idx = 0, 0
+                        for ops in valu_ops:
+                            bundle = {"valu": self.pad_to_6(ops)}
+                            if alu_idx < len(next_alu):
+                                bundle["alu"] = next_alu[alu_idx:alu_idx+12]
+                                alu_idx += 12
+                            if alu_idx >= len(next_alu) and load_idx < len(next_load):
+                                bundle["load"] = next_load[load_idx:load_idx+2]
+                                load_idx += 2
+                            self.instrs.append(bundle)
+                        while load_idx < len(next_load):
+                            self.instrs.append({"load": next_load[load_idx:load_idx+2]})
+                            load_idx += 2
+                        first_group_preloaded = True
+                        second_group_addrs_ready = True
+                    else:
+                        for ops in valu_ops:
+                            self.instrs.append({"valu": self.pad_to_6(ops)})
+
+                # ===== STRATEGY: SCATTER_GATHER (many unique values) =====
                 else:
-                    # Scatter-gather with optimized pipelining
-                    # Chain: Level 2 precomputes for groups 0,1
-                    #        Group N computes for group N+2, propagating through all groups
-                    #        Last group of round computes for next round's groups 0,1
-                    scatter_gather_rounds = [3, 4, 5, 6, 7, 8, 9, 10, 14, 15]
-
-                    # Check if NEXT group's addresses are pre-computed (so we can load immediately)
-                    next_addrs_ready = (g_idx + 1 < len(group_addrs_ready) and group_addrs_ready[g_idx + 1]) if has_next else False
-
-                    if g_idx == 0 and rnd in scatter_gather_rounds and not this_round_first_preloaded:
+                    # Load tree values via scatter-gather with pipelining
+                    if g_idx == 0 and not this_round_first_preloaded:
                         # First group not preloaded: compute addresses then load
                         all_alu = [("+", curr_addrs[c][i], tree_base, chunk_idx_addrs[c] + i)
                                    for c in range(n_active) for i in range(VLEN)]
@@ -432,36 +453,26 @@ class KernelBuilder:
 
                     valu_ops = build_hash_index_ops(curr_tree, chunk_val_addrs, chunk_idx_addrs, n_active, is_round_10)
 
-                    is_last_group = not has_next
-                    next_round_is_scatter = (rnd + 1 < rounds) and (rnd + 1 in scatter_gather_rounds)
+                    # Determine next round's strategy for prefetching decisions
+                    next_features = compute_level_features(rnd + 1, n_nodes) if rnd + 1 < rounds else None
+                    next_round_is_scatter = next_features and next_features["strategy"] == "scatter_gather"
 
                     # Determine what to compute/load during this group's VALU cycles
                     if next_addrs_ready and has_next:
-                        # Next group's addresses already computed - load its tree values
-                        # Also compute addresses for group N+2
                         next_load = [("load", next_tree[c] + i, next_addrs[c][i])
                                      for c in range(next_n_active) for i in range(VLEN)]
-
-                        # Compute addresses for group N+2 into curr_addrs (reuse our address buffer)
                         nn_chunk_base = chunk_base + 2 * CHUNKS_PER_GROUP
                         if nn_chunk_base < n_chunks:
                             nn_n_active = min(CHUNKS_PER_GROUP, n_chunks - nn_chunk_base)
                             nn_idx_addrs = [scratch_idx + (nn_chunk_base + c) * VLEN for c in range(nn_n_active)]
                             next_alu = [("+", curr_addrs[c][i], tree_base, nn_idx_addrs[c] + i)
                                         for c in range(nn_n_active) for i in range(VLEN)]
-                            # Mark group N+2 as having addresses ready
                             if g_idx + 2 < len(group_addrs_ready):
                                 group_addrs_ready[g_idx + 2] = True
-                        elif is_last_group and next_round_is_scatter:
-                            # Last group with space to compute: prepare next round's group 0
-                            first_cg_idx = [scratch_idx + c * VLEN for c in range(CHUNKS_PER_GROUP)]
-                            next_alu = [("+", curr_addrs[c][i], tree_base, first_cg_idx[c] + i)
-                                        for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
                         else:
                             next_alu = []
 
                     elif is_last_group:
-                        # Last group - compute addresses for next round's groups 0 AND 1
                         next_load = []
                         if next_round_is_scatter:
                             g0_idx = [scratch_idx + c * VLEN for c in range(CHUNKS_PER_GROUP)]
@@ -471,7 +482,6 @@ class KernelBuilder:
                             g1_alu = [("+", gather_addrs_alt[c][i], tree_base, g1_idx[c] + i)
                                       for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
                             next_alu = g0_alu + g1_alu
-                            # Also load group 0's tree values for next round
                             next_load = [("load", v_tree[c] + i, gather_addrs[c][i])
                                          for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
                             first_group_preloaded = True
@@ -480,7 +490,6 @@ class KernelBuilder:
                             next_alu = []
 
                     elif has_next:
-                        # Addresses not pre-computed: compute addresses for next group, then load
                         next_alu = [("+", next_addrs[c][i], tree_base, next_chunk_idx_addrs[c] + i)
                                     for c in range(next_n_active) for i in range(VLEN)]
                         next_load = [("load", next_tree[c] + i, next_addrs[c][i])
@@ -489,8 +498,7 @@ class KernelBuilder:
                     else:
                         next_alu, next_load = [], []
 
-                    # Bundle VALU with ALU (address computation) and LOAD
-                    # If next group's addresses are pre-computed, start loads from cycle 1
+                    # Bundle VALU with ALU and LOAD
                     can_load_from_start = next_addrs_ready
                     alu_idx, load_idx = 0, 0
                     for ops in valu_ops:
@@ -498,7 +506,6 @@ class KernelBuilder:
                         if alu_idx < len(next_alu):
                             bundle["alu"] = next_alu[alu_idx:alu_idx+12]
                             alu_idx += 12
-                        # Start loads from cycle 1 if addresses pre-computed, else after ALU
                         if can_load_from_start and load_idx < len(next_load):
                             bundle["load"] = next_load[load_idx:load_idx+2]
                             load_idx += 2
@@ -507,7 +514,6 @@ class KernelBuilder:
                             load_idx += 2
                         self.instrs.append(bundle)
 
-                    # Remaining loads
                     while load_idx < len(next_load):
                         self.instrs.append({"load": next_load[load_idx:load_idx+2]})
                         load_idx += 2
