@@ -425,11 +425,11 @@ class KernelBuilder:
                     next_round_is_scatter = (rnd + 1 < rounds) and (rnd + 1 in scatter_gather_rounds)
 
                     # OPTIMIZATION: Compute addresses 2 groups ahead instead of 1
-                    # Only applies when:
-                    # - Groups 0,1: addresses precomputed by level 2
-                    # - Groups 2+: addresses precomputed by group N-2 (which computed them into curr_addrs)
-                    # For groups 2+, we need to verify the previous group actually computed N+2 addresses
-                    addrs_ready = this_round_second_addrs_ready and g_idx <= 1  # Only 0,1 for now
+                    # Chain: Level 2 precomputes for groups 0,1
+                    #        Group 0 computes for group 2, Group 1 computes for group 3
+                    #        Group 2 computes for group 4, Group 3 computes for group 5
+                    # Groups 0-3 have addresses ready; groups 4-5 need to check if N-2 ran optimized
+                    addrs_ready = this_round_second_addrs_ready and g_idx <= 3
 
                     if addrs_ready and has_next:
                         # Addresses for next group already computed
@@ -462,9 +462,9 @@ class KernelBuilder:
                         next_alu, next_load = [], []
 
                     # OPTIMIZED bundling:
-                    # - If addresses pre-computed (groups 0,1 when second_addrs_ready), start loads from cycle 1
+                    # - If addresses pre-computed (groups 0-3 when second_addrs_ready), start loads from cycle 1
                     # - Otherwise, ALU first then loads
-                    can_load_from_start = this_round_second_addrs_ready and g_idx <= 1
+                    can_load_from_start = this_round_second_addrs_ready and g_idx <= 3
                     alu_idx, load_idx = 0, 0
                     for ops in valu_ops:
                         bundle = {"valu": self.pad_to_6(ops)}
