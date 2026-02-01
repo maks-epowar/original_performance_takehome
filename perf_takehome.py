@@ -71,7 +71,6 @@ class KernelBuilder:
         - Levels 5+: scatter-gather with pipelining
         """
         n_chunks = batch_size // VLEN  # 32 chunks
-        CHUNKS_PER_GROUP = 6  # Process 6 chunks per group to fully utilize 6 VALU slots
 
         # ===== SCRATCH ALLOCATION =====
         scratch_idx = self.alloc_scratch("scratch_idx", batch_size)
@@ -232,6 +231,12 @@ class KernelBuilder:
         ARITHMETIC_THRESHOLD = 4  # Use arithmetic selection if <= this many unique values
         CACHE_THRESHOLD = 64      # Cache in scratch if <= this many unique values
 
+        # Dynamic group sizing: key optimization!
+        # - Scatter-gather: 4 chunks/group (32 loads = 16 cycles, matches 16 VALU cycles exactly)
+        # - Broadcast/arithmetic: 6 chunks/group (no loads, maximize VALU efficiency)
+        CHUNKS_SG = 4  # For scatter-gather: eliminates LOAD-only cycles
+        CHUNKS_OTHER = 6  # For broadcast/arithmetic: better VALU slot utilization
+
         # Build VALU ops for hash + index update
         def build_hash_index_ops(tree_reg, val_addrs, idx_addrs, n, is_rnd10):
             ops = []
@@ -278,6 +283,14 @@ class KernelBuilder:
             else:
                 strategy = "scatter_gather"
 
+            # Dynamic group sizing based on strategy
+            # Scatter-gather: 4 chunks (32 loads = 16 cycles matches 16 VALU exactly)
+            # Others: 6 chunks (better VALU utilization, no load bottleneck)
+            if strategy == "scatter_gather":
+                chunks_per_group = CHUNKS_SG
+            else:
+                chunks_per_group = CHUNKS_OTHER
+
             # Buffer depth: more buffering for larger levels
             if strategy == "scatter_gather":
                 buffer_depth = 3 if num_unique > CACHE_THRESHOLD else 2
@@ -289,6 +302,7 @@ class KernelBuilder:
                 "num_unique": num_unique,
                 "level_start": level_start,
                 "strategy": strategy,
+                "chunks_per_group": chunks_per_group,
                 "buffer_depth": buffer_depth,
             }
 
@@ -302,9 +316,13 @@ class KernelBuilder:
             strategy = features["strategy"]
             level_start = features["level_start"]
             num_unique = features["num_unique"]
+            cpg = features["chunks_per_group"]  # Dynamic chunks per group
+
+            # Calculate number of groups for this round
+            n_groups_this_round = (n_chunks + cpg - 1) // cpg
 
             # Track address-ready state within the round
-            group_addrs_ready = [False] * 6
+            group_addrs_ready = [False] * n_groups_this_round
             this_round_first_preloaded = first_group_preloaded
             this_round_second_addrs_ready = second_group_addrs_ready
             first_group_preloaded = False
@@ -312,10 +330,11 @@ class KernelBuilder:
 
             if this_round_second_addrs_ready:
                 group_addrs_ready[0] = True
-                group_addrs_ready[1] = True
+                if len(group_addrs_ready) > 1:
+                    group_addrs_ready[1] = True
 
-            for g_idx, chunk_base in enumerate(range(0, n_chunks, CHUNKS_PER_GROUP)):
-                n_active = min(CHUNKS_PER_GROUP, n_chunks - chunk_base)
+            for g_idx, chunk_base in enumerate(range(0, n_chunks, cpg)):
+                n_active = min(cpg, n_chunks - chunk_base)
                 chunk_idx_addrs = [scratch_idx + (chunk_base + c) * VLEN for c in range(n_active)]
                 chunk_val_addrs = [scratch_val + (chunk_base + c) * VLEN for c in range(n_active)]
 
@@ -326,10 +345,10 @@ class KernelBuilder:
                 curr_addrs = gather_addrs_alt if use_alt else gather_addrs
                 next_addrs = gather_addrs if use_alt else gather_addrs_alt
 
-                next_chunk_base = chunk_base + CHUNKS_PER_GROUP
+                next_chunk_base = chunk_base + cpg
                 has_next = next_chunk_base < n_chunks
                 is_last_group = not has_next
-                next_n_active = min(CHUNKS_PER_GROUP, n_chunks - next_chunk_base) if has_next else 0
+                next_n_active = min(cpg, n_chunks - next_chunk_base) if has_next else 0
                 next_chunk_idx_addrs = [scratch_idx + (next_chunk_base + c) * VLEN for c in range(next_n_active)] if has_next else []
 
                 # Check if next group's addresses are pre-computed
@@ -346,16 +365,17 @@ class KernelBuilder:
                     should_prefetch = next_features and next_features["strategy"] == "scatter_gather" and is_last_group
 
                     if should_prefetch:
-                        # Prefetch for next round's first groups
-                        g0_idx = [scratch_idx + c * VLEN for c in range(CHUNKS_PER_GROUP)]
+                        # Prefetch for next round's first groups using next round's chunk size
+                        next_cpg = next_features["chunks_per_group"]
+                        g0_idx = [scratch_idx + c * VLEN for c in range(next_cpg)]
                         g0_alu = [("+", gather_addrs[c][i], tree_base, g0_idx[c] + i)
-                                  for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
-                        g1_idx = [scratch_idx + (CHUNKS_PER_GROUP + c) * VLEN for c in range(CHUNKS_PER_GROUP)]
+                                  for c in range(next_cpg) for i in range(VLEN)]
+                        g1_idx = [scratch_idx + (next_cpg + c) * VLEN for c in range(next_cpg)]
                         g1_alu = [("+", gather_addrs_alt[c][i], tree_base, g1_idx[c] + i)
-                                  for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
+                                  for c in range(next_cpg) for i in range(VLEN)]
                         next_alu = g0_alu + g1_alu
                         next_load = [("load", v_tree[c] + i, gather_addrs[c][i])
-                                     for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
+                                     for c in range(next_cpg) for i in range(VLEN)]
 
                         alu_idx, load_idx = 0, 0
                         for ops in valu_ops:
@@ -408,15 +428,16 @@ class KernelBuilder:
                     should_prefetch = next_features and next_features["strategy"] == "scatter_gather" and is_last_group
 
                     if should_prefetch:
-                        g0_idx = [scratch_idx + c * VLEN for c in range(CHUNKS_PER_GROUP)]
+                        next_cpg = next_features["chunks_per_group"]
+                        g0_idx = [scratch_idx + c * VLEN for c in range(next_cpg)]
                         g0_alu = [("+", gather_addrs[c][i], tree_base, g0_idx[c] + i)
-                                  for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
-                        g1_idx = [scratch_idx + (CHUNKS_PER_GROUP + c) * VLEN for c in range(CHUNKS_PER_GROUP)]
+                                  for c in range(next_cpg) for i in range(VLEN)]
+                        g1_idx = [scratch_idx + (next_cpg + c) * VLEN for c in range(next_cpg)]
                         g1_alu = [("+", gather_addrs_alt[c][i], tree_base, g1_idx[c] + i)
-                                  for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
+                                  for c in range(next_cpg) for i in range(VLEN)]
                         next_alu = g0_alu + g1_alu
                         next_load = [("load", v_tree[c] + i, gather_addrs[c][i])
-                                     for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
+                                     for c in range(next_cpg) for i in range(VLEN)]
 
                         alu_idx, load_idx = 0, 0
                         for ops in valu_ops:
@@ -461,9 +482,9 @@ class KernelBuilder:
                     if next_addrs_ready and has_next:
                         next_load = [("load", next_tree[c] + i, next_addrs[c][i])
                                      for c in range(next_n_active) for i in range(VLEN)]
-                        nn_chunk_base = chunk_base + 2 * CHUNKS_PER_GROUP
+                        nn_chunk_base = chunk_base + 2 * cpg
                         if nn_chunk_base < n_chunks:
-                            nn_n_active = min(CHUNKS_PER_GROUP, n_chunks - nn_chunk_base)
+                            nn_n_active = min(cpg, n_chunks - nn_chunk_base)
                             nn_idx_addrs = [scratch_idx + (nn_chunk_base + c) * VLEN for c in range(nn_n_active)]
                             next_alu = [("+", curr_addrs[c][i], tree_base, nn_idx_addrs[c] + i)
                                         for c in range(nn_n_active) for i in range(VLEN)]
@@ -475,15 +496,16 @@ class KernelBuilder:
                     elif is_last_group:
                         next_load = []
                         if next_round_is_scatter:
-                            g0_idx = [scratch_idx + c * VLEN for c in range(CHUNKS_PER_GROUP)]
+                            next_cpg = next_features["chunks_per_group"]
+                            g0_idx = [scratch_idx + c * VLEN for c in range(next_cpg)]
                             g0_alu = [("+", gather_addrs[c][i], tree_base, g0_idx[c] + i)
-                                      for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
-                            g1_idx = [scratch_idx + (CHUNKS_PER_GROUP + c) * VLEN for c in range(CHUNKS_PER_GROUP)]
+                                      for c in range(next_cpg) for i in range(VLEN)]
+                            g1_idx = [scratch_idx + (next_cpg + c) * VLEN for c in range(next_cpg)]
                             g1_alu = [("+", gather_addrs_alt[c][i], tree_base, g1_idx[c] + i)
-                                      for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
+                                      for c in range(next_cpg) for i in range(VLEN)]
                             next_alu = g0_alu + g1_alu
                             next_load = [("load", v_tree[c] + i, gather_addrs[c][i])
-                                         for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
+                                         for c in range(next_cpg) for i in range(VLEN)]
                             first_group_preloaded = True
                             second_group_addrs_ready = True
                         else:
