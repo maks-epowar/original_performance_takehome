@@ -237,6 +237,13 @@ class KernelBuilder:
             first_group_preloaded = False
             second_group_addrs_ready = False
 
+            # Track address-ready state within the round (propagates from group to group)
+            # group_addrs_ready[g] means group g's addresses are already computed
+            group_addrs_ready = [False] * 6
+            if this_round_second_addrs_ready:
+                group_addrs_ready[0] = True  # group 0's values loaded, addresses ready
+                group_addrs_ready[1] = True  # group 1's addresses ready (values will be loaded by group 0)
+
             for g_idx, chunk_base in enumerate(range(0, n_chunks, CHUNKS_PER_GROUP)):
                 n_active = min(CHUNKS_PER_GROUP, n_chunks - chunk_base)
                 chunk_idx_addrs = [scratch_idx + (chunk_base + c) * VLEN for c in range(n_active)]
@@ -404,9 +411,13 @@ class KernelBuilder:
 
                 else:
                     # Scatter-gather with optimized pipelining
-                    # When level 2 preloads both group 0's values AND group 1's addresses,
-                    # group 0 can start loading group 1 from cycle 1 and compute group 2's addresses
+                    # Chain: Level 2 precomputes for groups 0,1
+                    #        Group N computes for group N+2, propagating through all groups
+                    #        Last group of round computes for next round's groups 0,1
                     scatter_gather_rounds = [3, 4, 5, 6, 7, 8, 9, 10, 14, 15]
+
+                    # Check if NEXT group's addresses are pre-computed (so we can load immediately)
+                    next_addrs_ready = (g_idx + 1 < len(group_addrs_ready) and group_addrs_ready[g_idx + 1]) if has_next else False
 
                     if g_idx == 0 and rnd in scatter_gather_rounds and not this_round_first_preloaded:
                         # First group not preloaded: compute addresses then load
@@ -424,47 +435,63 @@ class KernelBuilder:
                     is_last_group = not has_next
                     next_round_is_scatter = (rnd + 1 < rounds) and (rnd + 1 in scatter_gather_rounds)
 
-                    # OPTIMIZATION: Compute addresses 2 groups ahead instead of 1
-                    # Chain: Level 2 precomputes for groups 0,1
-                    #        Group 0 computes for group 2, Group 1 computes for group 3
-                    #        Group 2 computes for group 4, Group 3 computes for group 5
-                    # Groups 0-3 have addresses ready; groups 4-5 need to check if N-2 ran optimized
-                    addrs_ready = this_round_second_addrs_ready and g_idx <= 3
-
-                    if addrs_ready and has_next:
-                        # Addresses for next group already computed
-                        # - For g_idx=0,1: by level 2
-                        # - For g_idx=2+: by group N-2 (via the alternating buffer pattern)
+                    # Determine what to compute/load during this group's VALU cycles
+                    if next_addrs_ready and has_next:
+                        # Next group's addresses already computed - load its tree values
+                        # Also compute addresses for group N+2
                         next_load = [("load", next_tree[c] + i, next_addrs[c][i])
                                      for c in range(next_n_active) for i in range(VLEN)]
-                        # Compute addresses for group N+2 into curr_addrs
+
+                        # Compute addresses for group N+2 into curr_addrs (reuse our address buffer)
                         nn_chunk_base = chunk_base + 2 * CHUNKS_PER_GROUP
                         if nn_chunk_base < n_chunks:
                             nn_n_active = min(CHUNKS_PER_GROUP, n_chunks - nn_chunk_base)
                             nn_idx_addrs = [scratch_idx + (nn_chunk_base + c) * VLEN for c in range(nn_n_active)]
                             next_alu = [("+", curr_addrs[c][i], tree_base, nn_idx_addrs[c] + i)
                                         for c in range(nn_n_active) for i in range(VLEN)]
+                            # Mark group N+2 as having addresses ready
+                            if g_idx + 2 < len(group_addrs_ready):
+                                group_addrs_ready[g_idx + 2] = True
+                        elif is_last_group and next_round_is_scatter:
+                            # Last group with space to compute: prepare next round's group 0
+                            first_cg_idx = [scratch_idx + c * VLEN for c in range(CHUNKS_PER_GROUP)]
+                            next_alu = [("+", curr_addrs[c][i], tree_base, first_cg_idx[c] + i)
+                                        for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
                         else:
                             next_alu = []
+
+                    elif is_last_group:
+                        # Last group - compute addresses for next round's groups 0 AND 1
+                        next_load = []
+                        if next_round_is_scatter:
+                            g0_idx = [scratch_idx + c * VLEN for c in range(CHUNKS_PER_GROUP)]
+                            g0_alu = [("+", gather_addrs[c][i], tree_base, g0_idx[c] + i)
+                                      for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
+                            g1_idx = [scratch_idx + (CHUNKS_PER_GROUP + c) * VLEN for c in range(CHUNKS_PER_GROUP)]
+                            g1_alu = [("+", gather_addrs_alt[c][i], tree_base, g1_idx[c] + i)
+                                      for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
+                            next_alu = g0_alu + g1_alu
+                            # Also load group 0's tree values for next round
+                            next_load = [("load", v_tree[c] + i, gather_addrs[c][i])
+                                         for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
+                            first_group_preloaded = True
+                            second_group_addrs_ready = True
+                        else:
+                            next_alu = []
+
                     elif has_next:
+                        # Addresses not pre-computed: compute addresses for next group, then load
                         next_alu = [("+", next_addrs[c][i], tree_base, next_chunk_idx_addrs[c] + i)
                                     for c in range(next_n_active) for i in range(VLEN)]
                         next_load = [("load", next_tree[c] + i, next_addrs[c][i])
                                      for c in range(next_n_active) for i in range(VLEN)]
-                    elif is_last_group and next_round_is_scatter:
-                        first_cg_idx = [scratch_idx + c * VLEN for c in range(CHUNKS_PER_GROUP)]
-                        next_alu = [("+", gather_addrs[c][i], tree_base, first_cg_idx[c] + i)
-                                    for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
-                        next_load = [("load", v_tree[c] + i, gather_addrs[c][i])
-                                     for c in range(CHUNKS_PER_GROUP) for i in range(VLEN)]
-                        first_group_preloaded = True
+
                     else:
                         next_alu, next_load = [], []
 
-                    # OPTIMIZED bundling:
-                    # - If addresses pre-computed (groups 0-3 when second_addrs_ready), start loads from cycle 1
-                    # - Otherwise, ALU first then loads
-                    can_load_from_start = this_round_second_addrs_ready and g_idx <= 3
+                    # Bundle VALU with ALU (address computation) and LOAD
+                    # If next group's addresses are pre-computed, start loads from cycle 1
+                    can_load_from_start = next_addrs_ready
                     alu_idx, load_idx = 0, 0
                     for ops in valu_ops:
                         bundle = {"valu": self.pad_to_6(ops)}
