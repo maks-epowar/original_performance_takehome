@@ -144,12 +144,15 @@ class KernelBuilder:
         s_l3_d45 = self.alloc_scratch("s_l3_d45")
         s_l3_d67 = self.alloc_scratch("s_l3_d67")
 
+        # Precomputed output addresses for faster result copy
+        out_addrs = [self.alloc_scratch(f"out_addr_{i}") for i in range(n_chunks)]
+
         # Memory pointers
         for v in ["rounds", "n_nodes", "batch_size", "forest_height", "forest_values_p", "inp_indices_p", "inp_values_p"]:
             self.alloc_scratch(v, 1)
 
         # ===== INITIALIZATION =====
-        # Load header values
+        # Load header values (pipelined)
         for i in range(0, 7, 2):
             self.instrs.append({"load": [("const", tmp1, i), ("const", tmp2, i+1 if i+1 < 7 else i)]})
             loads = [("load", self.scratch[["rounds", "n_nodes", "batch_size", "forest_height", "forest_values_p", "inp_indices_p", "inp_values_p"][i]], tmp1)]
@@ -157,62 +160,90 @@ class KernelBuilder:
                 loads.append(("load", self.scratch[["rounds", "n_nodes", "batch_size", "forest_height", "forest_values_p", "inp_indices_p", "inp_values_p"][i+1]], tmp2))
             self.instrs.append({"load": loads})
 
-        # Load constants
+        # Load constants with pipelined broadcasts
+        # Pipeline: load consts in cycle N, broadcast in cycle N+1 while loading next consts
         self.instrs.append({"load": [("const", s_zero, 0), ("const", s_one, 1)]})
-        self.instrs.append({"load": [("const", s_two, 2), ("const", tmp1, 4097)]})
-        self.instrs.append({"load": [("const", tmp2, 33), ("const", tmp3, 9)]})
-        self.instrs.append({"load": [("const", tmp4, 19)]})
+        self.instrs.append({"load": [("const", s_two, 2), ("const", tmp1, 4097)]})  # Load while s_zero, s_one ready
+        self.instrs.append({
+            "load": [("const", tmp2, 33), ("const", tmp3, 9)],
+            "valu": [("vbroadcast", v_one, s_one), ("vbroadcast", v_two, s_two)],
+        })
+        self.instrs.append({
+            "load": [("const", tmp4, 19), ("const", s_tree_diff, 16)],  # Reuse s_tree_diff temporarily
+            "valu": [("vbroadcast", v_mult_4097, tmp1), ("vbroadcast", v_mult_33, tmp2), ("vbroadcast", v_mult_9, tmp3)],
+        })
+        self.instrs.append({
+            "load": [("const", tmp1, 4), ("const", tmp2, 3)],
+            "valu": [("vbroadcast", v_shift_19, tmp4), ("vbroadcast", v_shift_16, s_tree_diff)],
+        })
+        self.instrs.append({
+            "load": [("const", tmp3, 7), ("const", tmp4, 0x7ED55D16)],
+            "valu": [("vbroadcast", v_four, tmp1), ("vbroadcast", v_three, tmp2)],
+        })
+        self.instrs.append({
+            "load": [("const", tmp1, 0xC761C23C), ("const", tmp2, 0x165667B1)],
+            "valu": [("vbroadcast", v_seven, tmp3), ("vbroadcast", v_hash_c0, tmp4)],
+        })
+        self.instrs.append({
+            "load": [("const", tmp3, 0xD3A2646C), ("const", tmp4, 0xFD7046C5)],
+            "valu": [("vbroadcast", v_hash_c1, tmp1), ("vbroadcast", v_hash_c2, tmp2)],
+        })
+        self.instrs.append({
+            "load": [("const", tmp1, 0xB55A4F09), ("const", tmp2, 9)],
+            "valu": [("vbroadcast", v_hash_c3, tmp3), ("vbroadcast", v_hash_c4, tmp4)],
+        })
+        self.instrs.append({
+            "valu": [("vbroadcast", v_hash_c5, tmp1), ("vbroadcast", v_shift_9, tmp2)],
+        })
 
-        self.instrs.append({"valu": [
-            ("vbroadcast", v_one, s_one), ("vbroadcast", v_two, s_two),
-            ("vbroadcast", v_mult_4097, tmp1), ("vbroadcast", v_mult_33, tmp2),
-            ("vbroadcast", v_mult_9, tmp3), ("vbroadcast", v_shift_19, tmp4),
-        ]})
-        self.instrs.append({"load": [("const", tmp1, 16), ("const", tmp2, 9)]})
-        self.instrs.append({"load": [("const", tmp3, 4)]})
-        self.instrs.append({"valu": [
-            ("vbroadcast", v_shift_16, tmp1), ("vbroadcast", v_shift_9, tmp2),
-            ("vbroadcast", v_four, tmp3),
-        ]})
-        self.instrs.append({"load": [("const", tmp1, 3), ("const", tmp2, 7)]})
-        self.instrs.append({"valu": [("vbroadcast", v_three, tmp1), ("vbroadcast", v_seven, tmp2)]})
-
-        # Hash constants
-        self.instrs.append({"load": [("const", tmp1, 0x7ED55D16), ("const", tmp2, 0xC761C23C)]})
-        self.instrs.append({"valu": [("vbroadcast", v_hash_c0, tmp1), ("vbroadcast", v_hash_c1, tmp2)]})
-        self.instrs.append({"load": [("const", tmp1, 0x165667B1), ("const", tmp2, 0xD3A2646C)]})
-        self.instrs.append({"valu": [("vbroadcast", v_hash_c2, tmp1), ("vbroadcast", v_hash_c3, tmp2)]})
-        self.instrs.append({"load": [("const", tmp1, 0xFD7046C5), ("const", tmp2, 0xB55A4F09)]})
-        self.instrs.append({"valu": [("vbroadcast", v_hash_c4, tmp1), ("vbroadcast", v_hash_c5, tmp2)]})
-
-        # Tree values for levels 0-2
+        # Tree values for levels 0-2 - optimized with pipelining
+        # Load offsets and compute addresses in parallel with loading tree values
         self.instrs.append({"load": [("load", s_tree0, self.scratch["forest_values_p"]), ("const", tmp1, 1)]})
-        self.instrs.append({"alu": [("+", tmp1, self.scratch["forest_values_p"], tmp1)]})
-        self.instrs.append({"load": [("load", s_tree1, tmp1), ("const", tmp2, 2)]})
-        self.instrs.append({"alu": [("+", tmp2, self.scratch["forest_values_p"], tmp2)]})
-        self.instrs.append({"load": [("load", s_tree2, tmp2)]})
-        self.instrs.append({"alu": [("-", s_tree_diff, s_tree1, s_tree2)]})
-
-        # Load tree level 2 values (indices 3-6)
-        self.instrs.append({"load": [("const", tmp1, 3), ("const", tmp2, 4)]})
-        self.instrs.append({"alu": [("+", tmp3, self.scratch["forest_values_p"], tmp1), ("+", tmp4, self.scratch["forest_values_p"], tmp2)]})
-        self.instrs.append({"load": [("load", s_tree3, tmp3), ("load", s_tree4, tmp4)]})
-        self.instrs.append({"load": [("const", tmp1, 5), ("const", tmp2, 6)]})
-        self.instrs.append({"alu": [("+", tmp3, self.scratch["forest_values_p"], tmp1), ("+", tmp4, self.scratch["forest_values_p"], tmp2)]})
-        self.instrs.append({"load": [("load", s_tree5, tmp3), ("load", s_tree6, tmp4)]})
-        self.instrs.append({"alu": [("-", s_diff_low, s_tree4, s_tree3), ("-", s_diff_high, s_tree6, s_tree5)]})
-        self.instrs.append({"valu": [
-            ("vbroadcast", v_tree3, s_tree3), ("vbroadcast", v_tree5, s_tree5),
-            ("vbroadcast", v_diff_low, s_diff_low), ("vbroadcast", v_diff_high, s_diff_high),
-        ]})
+        self.instrs.append({
+            "load": [("const", tmp2, 2), ("const", tmp3, 3)],
+            "alu": [("+", tmp1, self.scratch["forest_values_p"], tmp1)],
+        })
+        self.instrs.append({
+            "load": [("load", s_tree1, tmp1), ("const", tmp4, 4)],
+            "alu": [("+", tmp2, self.scratch["forest_values_p"], tmp2), ("+", tmp3, self.scratch["forest_values_p"], tmp3)],
+        })
+        self.instrs.append({
+            "load": [("load", s_tree2, tmp2), ("const", tmp1, 5)],
+            "alu": [("+", tmp4, self.scratch["forest_values_p"], tmp4)],
+        })
+        self.instrs.append({
+            "load": [("load", s_tree3, tmp3), ("load", s_tree4, tmp4)],
+            "alu": [("-", s_tree_diff, s_tree1, s_tree2), ("+", tmp1, self.scratch["forest_values_p"], tmp1)],
+        })
+        self.instrs.append({
+            "load": [("load", s_tree5, tmp1), ("const", tmp2, 6)],
+        })
+        self.instrs.append({
+            "alu": [("+", tmp2, self.scratch["forest_values_p"], tmp2)],
+        })
+        self.instrs.append({
+            "load": [("load", s_tree6, tmp2)],
+        })
+        self.instrs.append({
+            "alu": [("-", s_diff_low, s_tree4, s_tree3), ("-", s_diff_high, s_tree6, s_tree5)],
+            "valu": [("vbroadcast", v_tree3, s_tree3), ("vbroadcast", v_tree5, s_tree5)],
+        })
+        self.instrs.append({
+            "valu": [("vbroadcast", v_diff_low, s_diff_low), ("vbroadcast", v_diff_high, s_diff_high)],
+        })
 
         # Level 3 tree value initialization disabled (level 3 uses scatter-gather)
 
-        # Copy indices and values to scratch
+        # Copy indices and values to scratch, precompute output addresses
         for chunk in range(0, n_chunks, 2):
             off0, off1 = chunk * VLEN, (chunk + 1) * VLEN
             self.instrs.append({"load": [("const", tmp1, off0), ("const", tmp2, off1)]})
-            self.instrs.append({"alu": [("+", tmp3, self.scratch["inp_indices_p"], tmp1), ("+", tmp4, self.scratch["inp_indices_p"], tmp2)]})
+            self.instrs.append({"alu": [
+                ("+", tmp3, self.scratch["inp_indices_p"], tmp1),
+                ("+", tmp4, self.scratch["inp_indices_p"], tmp2),
+                ("+", out_addrs[chunk], self.scratch["inp_values_p"], tmp1),
+                ("+", out_addrs[chunk + 1], self.scratch["inp_values_p"], tmp2),
+            ]})
             self.instrs.append({"load": [("vload", scratch_idx + off0, tmp3), ("vload", scratch_idx + off1, tmp4)]})
             self.instrs.append({"alu": [("+", tmp3, self.scratch["inp_values_p"], tmp1), ("+", tmp4, self.scratch["inp_values_p"], tmp2)]})
             self.instrs.append({"load": [("vload", scratch_val + off0, tmp3), ("vload", scratch_val + off1, tmp4)]})
@@ -232,10 +263,10 @@ class KernelBuilder:
         CACHE_THRESHOLD = 64      # Cache in scratch if <= this many unique values
 
         # Dynamic group sizing: key optimization!
-        # - Scatter-gather: 4 chunks/group (32 loads = 16 cycles, matches 16 VALU cycles exactly)
-        # - Broadcast/arithmetic: 6 chunks/group (no loads, maximize VALU efficiency)
-        CHUNKS_SG = 4  # For scatter-gather: eliminates LOAD-only cycles
-        CHUNKS_OTHER = 6  # For broadcast/arithmetic: better VALU slot utilization
+        # - Scatter-gather: 4 chunks/group (32 loads = 16 cycles, limits LOAD-only cycles)
+        # - Broadcast/arithmetic: 6 chunks/group (no loads, no padding waste)
+        CHUNKS_SG = 4  # For scatter-gather: balance LOAD/VALU
+        CHUNKS_OTHER = 6  # For broadcast/arithmetic: no padding waste
 
         # Build VALU ops for hash + index update
         def build_hash_index_ops(tree_reg, val_addrs, idx_addrs, n, is_rnd10):
@@ -540,12 +571,10 @@ class KernelBuilder:
                         self.instrs.append({"load": next_load[load_idx:load_idx+2]})
                         load_idx += 2
 
-        # Copy results back to main memory
+        # Copy results back to main memory using precomputed addresses
         for chunk in range(0, n_chunks, 2):
             off0, off1 = chunk * VLEN, (chunk + 1) * VLEN
-            self.instrs.append({"load": [("const", tmp1, off0), ("const", tmp2, off1)]})
-            self.instrs.append({"alu": [("+", tmp3, self.scratch["inp_values_p"], tmp1), ("+", tmp4, self.scratch["inp_values_p"], tmp2)]})
-            self.instrs.append({"store": [("vstore", tmp3, scratch_val + off0), ("vstore", tmp4, scratch_val + off1)]})
+            self.instrs.append({"store": [("vstore", out_addrs[chunk], scratch_val + off0), ("vstore", out_addrs[chunk + 1], scratch_val + off1)]})
 
         # Final pause
         self.instrs.append({"flow": [("pause",)]})
